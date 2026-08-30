@@ -29,7 +29,7 @@ class WSIDataset(Dataset):
     Supports:
       - NEW coord map: coord_map[wsi][(x,y)] = global_cluster
       - OLD coord map: coord_map[(x,y)] = global_cluster (not recommended)
-    Unknown cluster id = num_clusters
+    Patches without a valid global-cluster mapping are dropped.
     """
 
     def __init__(self, args, wsi_labels, infold_cases, phase: str,
@@ -37,8 +37,6 @@ class WSIDataset(Dataset):
         self.args = args
         self.phase = phase
         self.target_cluster = target_cluster
-
-        self.unknown_cluster_id = int(args.num_clusters)
 
         if not coord_pkl_path:
             raise ValueError("coord_pkl_path is required.")
@@ -73,6 +71,16 @@ class WSIDataset(Dataset):
 
             cluster_ids = self._coords_to_cluster_ids(coords, case_id, slide_id)
 
+            # Only keep valid global cluster IDs: G0 ... G(num_clusters-1).
+            # Unmatched coordinates are marked as -1 by _coords_to_cluster_ids()
+            # and are removed here. No extra "unknown" cluster is used.
+            valid_mask = (cluster_ids >= 0) & (cluster_ids < int(args.num_clusters))
+            if valid_mask.sum() == 0:
+                continue
+
+            feats = feats[valid_mask]
+            cluster_ids = cluster_ids[valid_mask]
+
             if target_cluster is not None:
                 mask = (cluster_ids == int(target_cluster))
                 if mask.sum() < 10:
@@ -95,20 +103,31 @@ class WSIDataset(Dataset):
         logging.info(f"[WSIDataset-{phase}] loaded_wsis={len(self.infold_features)}")
 
     def _coords_to_cluster_ids(self, coords, case_id: str, slide_id: str) -> np.ndarray:
-        cids = np.full((coords.shape[0],), self.unknown_cluster_id, dtype=np.int64)
+        # -1 means "not mapped"; these patches are removed immediately in __init__.
+        # Valid cluster IDs are strictly 0 ... num_clusters-1.
+        cids = np.full((coords.shape[0],), -1, dtype=np.int64)
 
         if self.coord_map_is_new:
             # 优先 slide_id，其次 case_id
             wsi_map = self.coord_to_cluster.get(slide_id) or self.coord_to_cluster.get(case_id) or {}
             for i, (x, y) in enumerate(coords):
-                cids[i] = int(wsi_map.get((int(x), int(y)), self.unknown_cluster_id))
+                value = wsi_map.get((int(x), int(y)), None)
+                if value is None:
+                    continue
+
+                cid = int(value)
+                if 0 <= cid < int(self.args.num_clusters):
+                    cids[i] = cid
         else:
             for i, (x, y) in enumerate(coords):
-                cids[i] = int(self.coord_to_cluster.get((int(x), int(y)), self.unknown_cluster_id))
+                value = self.coord_to_cluster.get((int(x), int(y)), None)
+                if value is None:
+                    continue
 
-        # clamp to [0, unknown]
-        bad = (cids < 0) | (cids > self.unknown_cluster_id)
-        cids[bad] = self.unknown_cluster_id
+                cid = int(value)
+                if 0 <= cid < int(self.args.num_clusters):
+                    cids[i] = cid
+
         return cids
 
     def __len__(self):
